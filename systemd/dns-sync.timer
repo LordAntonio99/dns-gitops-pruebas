@@ -1,0 +1,10 @@
+[Unit]
+Description=Ejecuta dns-sync cada 60 segundos
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

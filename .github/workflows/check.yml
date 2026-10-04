@@ -1,0 +1,25 @@
+name: Comprobar zonas
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  zonas:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # el serial de cada zona sale de su último commit
+
+      - name: Instalar las herramientas de BIND
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bind9-utils
+
+      - name: Validar zonas y configuración
+        run: bash bin/render-check.sh . "$RUNNER_TEMP/render"

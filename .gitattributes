@@ -1,0 +1,2 @@
+# Los scripts de shell y las zonas deben ser siempre LF, también si se editan desde Windows.
+* text=auto eol=lf

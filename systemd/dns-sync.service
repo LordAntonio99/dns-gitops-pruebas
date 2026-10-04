@@ -1,0 +1,20 @@
+[Unit]
+Description=Sincroniza BIND9 con el repositorio Git de zonas
+Documentation=https://github.com/LordAntonio99/dns-gitops
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dns-sync
+SyslogIdentifier=dns-sync
+
+# Ajustes opcionales (REPO_DIR, BRANCH, GIT_SSH_COMMAND para un repo privado…)
+EnvironmentFile=-/etc/default/dns-sync
+
+# Endurecimiento: solo puede escribir donde despliega
+ProtectSystem=strict
+ReadWritePaths=/etc/bind /var/lib/dns-gitops
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true

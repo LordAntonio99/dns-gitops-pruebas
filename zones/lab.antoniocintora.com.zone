@@ -1,0 +1,13 @@
+$TTL 300
+@       IN SOA  ns1.lab.antoniocintora.com. hostmaster.lab.antoniocintora.com. (
+                @SERIAL@        ; serial: lo pone dns-sync (timestamp del último commit de esta zona)
+                3600            ; refresh
+                900             ; retry
+                604800          ; expire
+                300 )           ; TTL negativo
+
+        IN NS   ns1.lab.antoniocintora.com.
+
+ns1     IN A    192.168.50.10
+nas     IN A    192.168.50.20
+git     IN A    192.168.50.30

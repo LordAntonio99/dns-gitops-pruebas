@@ -1,0 +1,15 @@
+// Lista de zonas que sirve este BIND. Solo puede contener bloques "zone":
+// render-check.sh rechaza include, controls, key, options, logging…
+// Cada zona debe tener su fichero zones/<nombre>.zone en este repositorio.
+
+zone "lab.antoniocintora.com" {
+    type primary;
+    file "/etc/bind/zones/lab.antoniocintora.com.zone";
+    allow-transfer { none; };
+};
+
+zone "50.168.192.in-addr.arpa" {
+    type primary;
+    file "/etc/bind/zones/50.168.192.in-addr.arpa.zone";
+    allow-transfer { none; };
+};

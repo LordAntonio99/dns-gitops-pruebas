@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# dns-sync — despliega en BIND9 lo que hay en la rama main del repositorio de zonas.
+#
+# Lo lanza dns-sync.timer cada 60 s. El servidor TRAE los cambios (pull): no hay puerto abierto
+# hacia el CI ni claves de escritura en ningún sitio.
+#
+# Qué hace en cada ejecución:
+#   1. git fetch + merge --ff-only de origin/main (si alguien reescribe el historial, se niega)
+#   2. render-check.sh: pone el serial a cada zona y valida con named-checkzone/named-checkconf
+#   3. compara lo renderizado con lo instalado:
+#        · distinto y hay commit nuevo → DEPLOY
+#        · distinto y no hay commit nuevo → DRIFT: alguien editó el servidor a mano; se restaura
+#   4. instala de forma atómica, comprueba la configuración real con named-checkconf -z,
+#      recarga con rndc y verifica que BIND sirve el serial esperado
+#   5. si algo falla después de instalar, DEVUELVE los ficheros anteriores (rollback)
+#
+# Este script se instala a mano y NO se actualiza desde Git: lo que se despliega son datos
+# (zonas y configuración); un merge no puede ejecutar código como root en el servidor.
+#
+# Todo queda en el journal (journalctl -u dns-sync) y en /var/lib/dns-gitops/audit.log.
+set -euo pipefail
+
+REPO_DIR=${REPO_DIR:-/var/lib/dns-gitops/repo}
+STATE_DIR=${STATE_DIR:-/var/lib/dns-gitops}
+BRANCH=${BRANCH:-main}
+BIND_DIR=${BIND_DIR:-/etc/bind}
+BIND_GROUP=${BIND_GROUP:-bind}
+ZONES_DIR=${ZONES_DIR:-$BIND_DIR/zones}
+RENDER_CHECK=${RENDER_CHECK:-/usr/local/sbin/render-check.sh}
+RNDC=${RNDC:-rndc}
+export ZONES_DIR
+export GIT_TERMINAL_PROMPT=0
+
+CONF_FILES=(named.conf.options named.conf.zones)
+AUDIT_LOG=$STATE_DIR/audit.log
+
+shopt -s nullglob
+
+# --- registro ---------------------------------------------------------------------------------
+# Bajo systemd el prefijo <n> da la prioridad al journal (3 error, 4 aviso, 6 info):
+#   journalctl -u dns-sync -p warning
+log() {
+    local prio=$1 line
+    while IFS= read -r line; do
+        if [[ -t 1 ]]; then printf '%s\n' "$line"; else printf '<%s>%s\n' "$prio" "$line"; fi
+    done <<<"$2"
+}
+
+audit() { printf '%s %s\n' "$(date -Is)" "$*" >> "$AUDIT_LOG"; }
+
+# Un error persistente se escribe en el journal en cada ejecución, pero en audit.log una sola vez.
+fail() {
+    local key
+    log 3 "ERROR $1"
+    key=$(head -n1 <<<"$1" | sha1sum | cut -c1-12)   # solo la primera línea: el resto lleva rutas temporales
+    if [[ $(cat "$STATE_DIR/last-error" 2>/dev/null || true) != "$key" ]]; then
+        audit "ERROR $(head -n1 <<<"$1")"
+        printf '%s\n' "$key" > "$STATE_DIR/last-error"
+    fi
+    exit 1
+}
+
+# --- piezas -----------------------------------------------------------------------------------
+git_() { git -C "$REPO_DIR" "$@"; }
+
+install_atomic() {   # install_atomic <origen> <destino>
+    local tmp
+    tmp=$(mktemp "$2.XXXXXX")
+    install -o root -g "$BIND_GROUP" -m 0644 "$1" "$tmp"
+    mv -f "$tmp" "$2"
+}
+
+snapshot() {
+    local f
+    mkdir -p "$work/backup/zones"
+    for f in "$ZONES_DIR"/*.zone; do cp -p "$f" "$work/backup/zones/"; done
+    for f in "${CONF_FILES[@]}"; do
+        if [[ -f $BIND_DIR/$f ]]; then cp -p "$BIND_DIR/$f" "$work/backup/"; fi
+    done
+    return 0
+}
+
+rollback() {
+    local f
+    rm -f "$ZONES_DIR"/*.zone
+    for f in "$work"/backup/zones/*.zone; do cp -p "$f" "$ZONES_DIR/"; done
+    for f in "${CONF_FILES[@]}"; do
+        if [[ -f $work/backup/$f ]]; then cp -p "$work/backup/$f" "$BIND_DIR/$f"; else rm -f "$BIND_DIR/$f"; fi
+    done
+    "$RNDC" reconfig >/dev/null 2>&1 || true
+    "$RNDC" reload >/dev/null 2>&1 || true
+    log 4 "ROLLBACK: restaurados los ficheros anteriores"
+    audit "ROLLBACK $short: restaurado lo anterior"
+}
+
+wait_serials() {   # BIND debe servir el serial que acabamos de renderizar
+    local zone want got
+    while IFS=$'\t' read -r zone want; do
+        [[ -n $zone ]] || continue
+        got=
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            got=$("$RNDC" zonestatus "$zone" 2>/dev/null | awk '/^serial:/ {print $2}')
+            [[ $got == "$want" ]] && break
+            sleep 0.5
+        done
+        if [[ $got != "$want" ]]; then
+            echo "$zone: BIND sirve el serial '${got:-ninguno}' y se esperaba $want"
+            return 1
+        fi
+    done < "$work/render/serials"
+}
+
+# --- principal --------------------------------------------------------------------------------
+mkdir -p "$STATE_DIR"
+exec 9>"$STATE_DIR/lock"
+flock -n 9 || { log 6 "ya hay otra ejecución en curso"; exit 0; }
+
+work=$(mktemp -d "$STATE_DIR/work.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+[[ -d $REPO_DIR/.git ]] || fail "$REPO_DIR no es un clon de git"
+[[ $(git_ rev-parse --abbrev-ref HEAD) == "$BRANCH" ]] || fail "la copia de trabajo no está en la rama $BRANCH"
+[[ -z $(git_ status --porcelain --untracked-files=no) ]] || fail "la copia de trabajo tiene cambios locales: nadie debe editar $REPO_DIR"
+
+timeout 30 git -C "$REPO_DIR" fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" \
+    || fail "no se puede traer origin/$BRANCH (git fetch)"
+# El servidor solo avanza: si origin/main ya no contiene lo desplegado (force-push), se niega
+git_ merge-base --is-ancestor HEAD "origin/$BRANCH" \
+    || fail "origin/$BRANCH ya no contiene la versión desplegada ($(git_ rev-parse --short HEAD)): ¿se ha reescrito el historial?"
+git_ merge --ff-only --quiet "origin/$BRANCH" \
+    || fail "la copia local no puede avanzar a origin/$BRANCH sin mezclar"
+
+head=$(git_ rev-parse HEAD)
+short=${head:0:7}
+deployed=$(cat "$STATE_DIR/deployed.sha" 2>/dev/null || true)
+author=$(git_ log -1 --format='%an' HEAD)
+subject=$(git_ log -1 --format='%s' HEAD)
+subject=${subject//\"/\'}   # las comillas romperían el formato de audit.log
+when=$(git_ log -1 --format='%aI' HEAD)
+
+# 1) Validar. Si falla, no se toca nada: BIND sigue sirviendo lo último que pasó la validación.
+if ! res=$("$RENDER_CHECK" "$REPO_DIR" "$work/render" 2>&1); then
+    fail "$short «$subject» ($author) NO pasa la validación; no se despliega y BIND sigue con la versión anterior
+$res"
+fi
+
+# 2) ¿Qué difiere de lo instalado?
+changed=()
+stale=()
+for f in "$work"/render/zones/*.zone; do
+    cmp -s "$f" "$ZONES_DIR/${f##*/}" || changed+=("zones/${f##*/}")
+done
+for f in "${CONF_FILES[@]}"; do
+    cmp -s "$work/render/named/$f" "$BIND_DIR/$f" || changed+=("$f")
+done
+for f in "$ZONES_DIR"/*.zone; do
+    [[ -e $work/render/zones/${f##*/} ]] || stale+=("zones/${f##*/}")
+done
+
+if (( ${#changed[@]} == 0 && ${#stale[@]} == 0 )); then
+    if [[ $deployed != "$head" ]]; then
+        printf '%s\n' "$head" > "$STATE_DIR/deployed.sha"
+        log 6 "SYNC $short «$subject»: no cambia nada que sirva BIND"
+        audit "SYNC $short autor=\"$author\" asunto=\"$subject\" (sin cambios en BIND)"
+    fi
+    rm -f "$STATE_DIR/last-error"
+    exit 0
+fi
+
+touched="${changed[*]:-} ${stale[*]:+(borradas: ${stale[*]})}"
+
+if [[ $deployed == "$head" ]]; then
+    log 4 "DRIFT: lo que sirve este servidor no coincide con Git ($short); alguien lo ha editado a mano:${touched}"
+    for item in "${changed[@]}"; do
+        case $item in
+            zones/*) live=$ZONES_DIR/${item#zones/}; want=$work/render/$item ;;
+            *)       live=$BIND_DIR/$item;           want=$work/render/named/$item ;;
+        esac
+        if [[ -f $live ]]; then
+            log 4 "  $live modificado el $(stat -c %y "$live" | cut -d. -f1) (lo que había → lo que dice Git)"
+            log 4 "$(diff -u "$live" "$want" | tail -n +3 | head -n 12 || true)"
+        else
+            log 4 "  $live ha desaparecido del servidor"
+        fi
+    done
+    kind=DRIFT
+else
+    kind=DEPLOY
+    log 6 "DEPLOY $short «$subject» ($author, $when)"
+    if git_ cat-file -e "${deployed:-x}^{commit}" 2>/dev/null; then
+        log 6 "$(git_ log --format='  · %h %an: %s' "$deployed..$head")"
+    fi
+fi
+
+# 3) Instalar de forma atómica; desde aquí, cualquier fallo devuelve los ficheros anteriores
+snapshot
+mkdir -p "$ZONES_DIR"
+chown root:"$BIND_GROUP" "$ZONES_DIR"
+chmod 0755 "$ZONES_DIR"
+for f in "$work"/render/zones/*.zone; do install_atomic "$f" "$ZONES_DIR/${f##*/}"; done
+for item in "${stale[@]}"; do rm -f "$ZONES_DIR/${item#zones/}"; done
+for f in "${CONF_FILES[@]}"; do install_atomic "$work/render/named/$f" "$BIND_DIR/$f"; done
+
+# 4) La configuración REAL, ya instalada, con todas las zonas cargadas de prueba
+if ! res=$(named-checkconf -z "$BIND_DIR/named.conf" 2>&1); then
+    rollback
+    fail "$short: la configuración instalada no pasa named-checkconf -z
+$res"
+fi
+
+# 5) Recargar y comprobar que BIND sirve lo que toca
+if ! res=$("$RNDC" reconfig 2>&1 && "$RNDC" reload 2>&1); then
+    rollback
+    fail "$short: rndc no ha podido recargar BIND
+$res"
+fi
+if ! res=$(wait_serials); then
+    rollback
+    fail "$short: BIND no ha cargado lo desplegado
+$res"
+fi
+
+printf '%s\n' "$head" > "$STATE_DIR/deployed.sha"
+rm -f "$STATE_DIR/last-error"
+if [[ $kind == DRIFT ]]; then
+    log 6 "OK $short restaurado:${touched}"
+    audit "DRIFT $short restaurado:${touched}"
+else
+    log 6 "OK $short desplegado:${touched}"
+    audit "DEPLOY $short autor=\"$author\" fecha=\"$when\" asunto=\"$subject\" cambios:${touched}"
+fi
